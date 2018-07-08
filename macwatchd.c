@@ -40,6 +40,7 @@ struct macwatch *find_entry(struct macwatch *);
 void		print_list(void);
 void		print_entry(struct macwatch *);
 int		add_prefixes(struct pfr_buffer *);
+struct ether_addr *get_etheraddr(struct sockaddr *);
 int		main(int, char *[]);
 
 volatile sig_atomic_t	 quit, reconfig;
@@ -207,7 +208,7 @@ find_entry(struct macwatch *mw)
 
 	LIST_FOREACH(found, &macwatch_h, entries) {
 		if (!memcmp(&mw->mac, &found->mac, sizeof(struct ether_addr)) &&
-		    !memcmp(&mw->sa, &found->sa, sizeof(struct sockaddr)))
+		    !memcmp(&mw->sa, &found->sa, found->sa.sa_family == AF_INET6 ? sizeof(struct sockaddr_in6) : sizeof(struct sockaddr_in)))
 			return (found);
 	}
 	return (NULL);
@@ -268,6 +269,19 @@ print_list(void)
 	LIST_FOREACH(mw, &macwatch_h, entries) {
 		print_entry(mw);
 	}
+}
+
+struct ether_addr *
+get_etheraddr(struct sockaddr *sa)
+{
+	struct macwatch		*mw;
+
+	LIST_FOREACH(mw, &macwatch_h, entries) {
+		if (mw->sa.sa_family == sa->sa_family)
+			if (memcmp(&mw->sa, sa, sa->sa_family == AF_INET6 ? sizeof(struct sockaddr_in6) : sizeof(struct sockaddr_in)) == 0)
+				return (&mw->mac);
+	}
+	return (NULL);
 }
 
 static inline struct sockaddr_dl *
@@ -386,7 +400,6 @@ add_prefixes(struct pfr_buffer *b)
         LIST_FOREACH(mw, &macwatch_h, entries) {
 		memset(&addr, 0, sizeof(struct pfr_addr));
 		addr.pfra_af = mw->sa.sa_family;
-
 		switch (addr.pfra_af) {
 		case AF_INET:
 			memcpy(&sa, &mw->sa, sizeof(struct sockaddr_in));
