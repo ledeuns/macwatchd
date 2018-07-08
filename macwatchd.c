@@ -17,21 +17,35 @@
 #include <string.h>
 #include <sys/sysctl.h>
 #include <sys/queue.h>
+#include <net/pfvar.h>
+#include <fcntl.h>
+#include <sys/ioctl.h>
+
+enum {  PFRB_TABLES = 1, PFRB_TSTATS, PFRB_ADDRS, PFRB_ASTATS,
+        PFRB_IFACES, PFRB_TRANS, PFRB_MAX };
+struct pfr_buffer {
+        int      pfrb_type;     /* type of content, see enum above */
+        int      pfrb_size;     /* number of objects in buffer */
+        int      pfrb_msize;    /* maximum number of objects in buffer */
+        void    *pfrb_caddr;    /* malloc'ated memory area */
+};
 
 void		sighdlr(int);
 __dead void	usage(void);
 void		processrtmsg(struct rt_msghdr *, int);
 struct macwatch	*get_addr(char *, int);
+int		buf_grow(struct pfr_buffer *, int);
 void		get_entries(void);
-struct macwatch *find_mac(struct macwatch *);
+struct macwatch *find_entry(struct macwatch *);
 void		print_list(void);
 void		print_entry(struct macwatch *);
+int		add_prefixes(struct pfr_buffer *);
 int		main(int, char *[]);
 
 volatile sig_atomic_t	 quit, reconfig;
 struct rt_msghdr	*rtmsg;
 struct ether_addr	*mac;
-
+char			*pf_device = "/dev/pf";
 
 LIST_HEAD(macwatch_head, macwatch) macwatch_h;
 
@@ -66,7 +80,7 @@ usage(void)
 {
         extern char *__progname;
 
-        fprintf(stderr, "usage: %s [-d] [-m macaddress]\n", __progname);
+        fprintf(stderr, "usage: %s [-d] [-m macaddress] [-p pfdev] -t tablename\n", __progname);
         exit(1);
 }
 
@@ -80,8 +94,13 @@ main(int argc, char *argv[])
 	char		msg[2048];
 	struct pollfd	pfd[1];
 	struct macwatch *mw;
+	struct pfr_table table;
+	struct pfioc_table io;
+	int		 dev = -1;
 
-	while ((ch = getopt(argc, argv, "dm:")) != -1) {
+	memset(&table, 0, sizeof(struct pfr_table));
+
+	while ((ch = getopt(argc, argv, "dm:p:t:")) != -1) {
 		switch (ch) {
 		case 'd':
 			debug = 1;
@@ -89,7 +108,17 @@ main(int argc, char *argv[])
 		case 'm':
 			mac = ether_aton(optarg);
 			if (mac == NULL)
-				printf("invalid mac\n");
+				errx(1, "invalid mac");
+			break;
+		case 'p':
+			pf_device = optarg;
+			break;
+		case 't':
+			if (strlen(optarg) >= PF_TABLE_NAME_SIZE ||
+			    strlen(optarg) < 1)
+				usage();
+			if (strlcpy(table.pfrt_name, optarg, sizeof(table.pfrt_name)) >= sizeof(table.pfrt_name))
+				errx(1, "pfctl_table: strlcpy");
 			break;
 		default:
 			usage();
@@ -109,6 +138,27 @@ main(int argc, char *argv[])
 	LIST_INIT(&macwatch_h);
 	get_entries();
 	print_list();
+
+	struct pfr_buffer b;
+	int size;
+
+	memset(&b, 0, sizeof(struct pfr_buffer));
+	memset(&io, 0, sizeof(struct pfioc_table));
+
+	dev = open(pf_device, O_RDWR);
+	if (dev == -1)
+		err(1, "%s", pf_device);
+
+	b.pfrb_type = PFRB_ADDRS;
+	size = add_prefixes(&b);
+	printf("%d", size);
+        io.pfrio_flags = 0;
+        io.pfrio_table = table;
+        io.pfrio_buffer = b.pfrb_caddr;
+        io.pfrio_esize = sizeof(struct pfr_addr);
+        io.pfrio_size = size;
+        if (ioctl(dev, DIOCRADDADDRS, &io))
+                err(1, "DIOCRADDADDRS");
 
 /* Main loop */
         s = socket(PF_ROUTE, SOCK_RAW, AF_UNSPEC);
@@ -148,7 +198,7 @@ main(int argc, char *argv[])
 }
 
 struct macwatch *
-find_mac(struct macwatch *mw)
+find_entry(struct macwatch *mw)
 {
 	struct macwatch *found;
 
@@ -182,7 +232,7 @@ processrtmsg(struct rt_msghdr *rtm, int len)
 		break;
 	case RTM_DELETE:
 		mw = get_addr(((char *)rtm + rtm->rtm_hdrlen), rtm->rtm_addrs);
-		if ((found = find_mac(mw))) {
+		if ((found = find_entry(mw))) {
 			LIST_REMOVE(found, entries);
 			free(mw);
 		}
@@ -324,3 +374,69 @@ get_entries(void)
         }
         free(buf);
 }
+
+int
+add_prefixes(struct pfr_buffer *b)
+{
+	struct pfr_addr	 addr;
+	struct macwatch *mw;
+	struct sockaddr_in sa;
+	struct sockaddr_in6 sa6;
+
+        LIST_FOREACH(mw, &macwatch_h, entries) {
+		memset(&addr, 0, sizeof(struct pfr_addr));
+		addr.pfra_af = mw->sa.sa_family;
+
+		switch (addr.pfra_af) {
+		case AF_INET:
+			memcpy(&sa, &mw->sa, sizeof(struct sockaddr_in));
+			addr.pfra_ip4addr.s_addr = sa.sin_addr.s_addr;
+			addr.pfra_net = 32;
+			break;
+		case AF_INET6:
+			memcpy(&sa6, &mw->sa, sizeof(struct sockaddr_in6));
+			memcpy(&addr.pfra_ip6addr, &sa6.sin6_addr.s6_addr, sizeof(struct in6_addr));
+			addr.pfra_net = 128;
+			break;
+		default:
+			errx(1, "Unsupported AF");
+		}
+
+		if (b->pfrb_msize == b->pfrb_size)
+			if (buf_grow(b, 0))
+				return (-1);
+
+		memcpy(((caddr_t)b->pfrb_caddr) + sizeof(struct pfr_addr) * b->pfrb_size, &addr, sizeof(struct pfr_addr));
+		b->pfrb_size++;
+        }
+	return (b->pfrb_size);
+}
+
+int
+buf_grow(struct pfr_buffer *b, int minsize)
+{
+        caddr_t p;
+        size_t bs;
+
+        if (b == NULL) {
+                errno = EINVAL;
+                return (-1);
+        }
+        if (minsize != 0 && minsize <= b->pfrb_msize)
+                return (0);
+        bs = sizeof(struct pfr_addr);
+        if (!b->pfrb_msize) {
+                if (minsize < 10)
+                        minsize = 10;
+        }
+        if (minsize == 0)
+                minsize = b->pfrb_msize * 2;
+        p = reallocarray(b->pfrb_caddr, minsize, bs);
+        if (p == NULL)
+                return (-1);
+        bzero(p + b->pfrb_msize * bs, (minsize - b->pfrb_msize) * bs);
+        b->pfrb_caddr = p;
+        b->pfrb_msize = minsize;
+        return (0);
+}
+
