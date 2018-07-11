@@ -33,19 +33,25 @@ struct pfr_buffer {
 void		sighdlr(int);
 __dead void	usage(void);
 void		processrtmsg(struct rt_msghdr *, int);
-struct macwatch	*get_addr(char *, int);
+struct macwatch	*fill_macwatch(char *, int);
 int		buf_grow(struct pfr_buffer *, int);
 void		get_entries(void);
-struct macwatch *find_entry(struct macwatch *);
+int		extract_addr(char *, int, struct sockaddr **, struct ether_addr **);
+struct macwatch *find_entrybyip(struct sockaddr *);
+struct macwatch *find_entrybymac(struct ether_addr *);
 void		print_list(void);
 void		print_entry(struct macwatch *);
-int		add_prefixes(struct pfr_buffer *);
+int		insert_addr(struct pfr_buffer *, struct sockaddr *);
+int		remove_addr(struct pfr_buffer *, struct sockaddr *);
+int		table_insert(struct pfr_table, struct pfr_buffer);
+int		table_remove(struct pfr_table, struct pfr_buffer);
 struct ether_addr *get_etheraddr(struct sockaddr *);
 int		main(int, char *[]);
 
 volatile sig_atomic_t	 quit, reconfig;
 struct rt_msghdr	*rtmsg;
 struct ether_addr	*mac;
+struct			 pfr_table table;
 char			*pf_device = "/dev/pf";
 
 LIST_HEAD(macwatch_head, macwatch) macwatch_h;
@@ -53,7 +59,7 @@ LIST_HEAD(macwatch_head, macwatch) macwatch_h;
 struct macwatch {
 	LIST_ENTRY(macwatch)	entries;
 	struct ether_addr	mac;
-	struct sockaddr		sa;
+	struct pfr_buffer	addrlist;
 };
 
 #define ROUNDUP(a) \
@@ -95,9 +101,6 @@ main(int argc, char *argv[])
 	char		msg[2048];
 	struct pollfd	pfd[1];
 	struct macwatch *mw;
-	struct pfr_table table;
-	struct pfioc_table io;
-	int		 dev = -1;
 
 	memset(&table, 0, sizeof(struct pfr_table));
 
@@ -137,29 +140,12 @@ main(int argc, char *argv[])
 
 /* Init */
 	LIST_INIT(&macwatch_h);
+
 	get_entries();
 	print_list();
-
-	struct pfr_buffer b;
-	int size;
-
-	memset(&b, 0, sizeof(struct pfr_buffer));
-	memset(&io, 0, sizeof(struct pfioc_table));
-
-	dev = open(pf_device, O_RDWR);
-	if (dev == -1)
-		err(1, "%s", pf_device);
-
-	b.pfrb_type = PFRB_ADDRS;
-	size = add_prefixes(&b);
-	printf("%d", size);
-        io.pfrio_flags = 0;
-        io.pfrio_table = table;
-        io.pfrio_buffer = b.pfrb_caddr;
-        io.pfrio_esize = sizeof(struct pfr_addr);
-        io.pfrio_size = size;
-        if (ioctl(dev, DIOCRADDADDRS, &io))
-                err(1, "DIOCRADDADDRS");
+	LIST_FOREACH(mw, &macwatch_h, entries) {
+		table_insert(table, mw->addrlist);
+	}
 
 /* Main loop */
         s = socket(PF_ROUTE, SOCK_RAW, AF_UNSPEC);
@@ -189,7 +175,6 @@ main(int argc, char *argv[])
 			processrtmsg((struct rt_msghdr *)msg, n);
 		}
 	}
-	print_list();
 	if(!LIST_EMPTY(&macwatch_h)) {
 		mw = LIST_FIRST(&macwatch_h);
 		LIST_REMOVE(mw, entries);
@@ -198,17 +183,70 @@ main(int argc, char *argv[])
 	printf("Done!\n");
 }
 
+int
+table_insert(struct pfr_table tbl, struct pfr_buffer pfrb)
+{
+	struct pfr_buffer b;
+	struct pfioc_table io;
+	int		 dev = -1;
+
+	dev = open(pf_device, O_RDWR);
+	if (dev == -1)
+		err(1, "%s", pf_device);
+
+	memset(&b, 0, sizeof(struct pfr_buffer));
+	memset(&io, 0, sizeof(struct pfioc_table));
+	b.pfrb_caddr = pfrb.pfrb_caddr;
+	b.pfrb_type = PFRB_ADDRS;
+        io.pfrio_flags = 0;
+        io.pfrio_table = tbl;
+        io.pfrio_buffer = pfrb.pfrb_caddr;
+        io.pfrio_esize = sizeof(struct pfr_addr);
+        io.pfrio_size = pfrb.pfrb_size;
+        if (ioctl(dev, DIOCRADDADDRS, &io))
+                err(1, "DIOCRADDADDRS");
+
+	close(dev);
+	return (io.pfrio_nadd);
+}
+
+int
+table_remove(struct pfr_table tbl, struct pfr_buffer pfrb)
+{
+	struct pfr_buffer b;
+	struct pfioc_table io;
+	int		 dev = -1;
+
+	dev = open(pf_device, O_RDWR);
+	if (dev == -1)
+		err(1, "%s", pf_device);
+
+	memset(&b, 0, sizeof(struct pfr_buffer));
+	memset(&io, 0, sizeof(struct pfioc_table));
+	b.pfrb_caddr = pfrb.pfrb_caddr;
+	b.pfrb_type = PFRB_ADDRS;
+        io.pfrio_flags = 0;
+        io.pfrio_table = tbl;
+        io.pfrio_buffer = pfrb.pfrb_caddr;
+        io.pfrio_esize = sizeof(struct pfr_addr);
+        io.pfrio_size = pfrb.pfrb_size;
+        if (ioctl(dev, DIOCRDELADDRS, &io))
+                err(1, "DIOCRDELADDRS");
+
+	close(dev);
+	return (io.pfrio_ndel);
+}
+
 struct macwatch *
-find_entry(struct macwatch *mw)
+find_entrybymac(struct ether_addr *ea)
 {
 	struct macwatch *found;
 
-	if (mw == NULL)
+	if (ea == NULL)
 		return (NULL);
 
 	LIST_FOREACH(found, &macwatch_h, entries) {
-		if (!memcmp(&mw->mac, &found->mac, sizeof(struct ether_addr)) &&
-		    !memcmp(&mw->sa, &found->sa, found->sa.sa_family == AF_INET6 ? sizeof(struct sockaddr_in6) : sizeof(struct sockaddr_in)))
+		if (memcmp(ea, &found->mac, sizeof(struct ether_addr)) == 0)
 			return (found);
 	}
 	return (NULL);
@@ -217,47 +255,84 @@ find_entry(struct macwatch *mw)
 void
 processrtmsg(struct rt_msghdr *rtm, int len)
 {
-	struct macwatch  *mw, *found;
+	struct sockaddr		*sa;
+	struct macwatch		*mw = NULL, *previous_mw;
+	struct ether_addr	*ea;
+	int			 n;
 
         if (rtm->rtm_version != RTM_VERSION) {
                 warnx("routing message version %d not understood",
                     rtm->rtm_version);
                 return;
         }
+
+        if(extract_addr(((char *)rtm + rtm->rtm_hdrlen), rtm->rtm_addrs, &sa, &ea))
+                return;
+
+        mw = find_entrybymac(ea);
+        previous_mw = mw;
+
         switch (rtm->rtm_type) {
 	case RTM_RESOLVE:
-		mw = get_addr(((char *)rtm + rtm->rtm_hdrlen), rtm->rtm_addrs);
-		if (mw)
-			LIST_INSERT_HEAD(&macwatch_h, mw, entries);
-		quit = 1;
+		if (mw == NULL) {
+			mw = malloc(sizeof(struct macwatch));
+			if (mw == NULL)
+				err(1, "%s: ", __func__);
+			memset(mw, 0, sizeof(struct macwatch));
+			memcpy(&mw->mac, ea, sizeof(struct ether_addr));
+		}
+		if (insert_addr(&mw->addrlist, sa))
+			break;
+		if (previous_mw)
+                	LIST_REMOVE(previous_mw, entries);
+		LIST_INSERT_HEAD(&macwatch_h, mw, entries);
+		table_insert(table, mw->addrlist);
 		break;
 	case RTM_DELETE:
-		mw = get_addr(((char *)rtm + rtm->rtm_hdrlen), rtm->rtm_addrs);
-		if ((found = find_entry(mw))) {
-			LIST_REMOVE(found, entries);
+		if (mw == NULL)	/* Don't try to remove from non-existent list */
+			break;		
+
+               	LIST_REMOVE(previous_mw, entries);
+		n = remove_addr(&mw->addrlist, sa);
+		table_remove(table, mw->addrlist);
+		if (n)
+			LIST_INSERT_HEAD(&macwatch_h, mw, entries);
+		else
 			free(mw);
-		}
 		break;
 	default:
+		errx(1, "%s: Unsupported msg", __func__);
 		break;
 	}
+	print_list();
 }
 
 void
 print_entry(struct macwatch *mw)
 {
-	int error;
-	char hbuf[NI_MAXHOST];
+	int 			 i;
+	struct pfr_addr		*pfra;
+	static char		 buf[48];
 
 	if (mw == NULL)
 		return;
 
-	error = getnameinfo(&mw->sa, mw->sa.sa_len, hbuf, sizeof(hbuf), NULL, 0, NI_NUMERICHOST);
-	if (error) {
-		warnx("error print_list()\n");
-		return;
+	printf("MAC: %s (%d)\n", ether_ntoa(&mw->mac), mw->addrlist.pfrb_size);
+
+	pfra = (struct pfr_addr *)mw->addrlist.pfrb_caddr;
+	for (i = 0; i < mw->addrlist.pfrb_size; i++) {
+		pfra = (struct pfr_addr *)(((caddr_t)mw->addrlist.pfrb_caddr) + sizeof(struct pfr_addr) * i);
+		switch (pfra->pfra_af) {
+		case AF_INET:
+			printf("-> IPv4: %s\n", inet_ntop(pfra->pfra_af, &pfra->pfra_ip4addr, buf, sizeof(buf)));
+			break;
+		case AF_INET6:
+			printf("-> IPv6: %s\n", inet_ntop(pfra->pfra_af, &pfra->pfra_ip6addr, buf, sizeof(buf)));
+			break;
+		default:
+			errx(1, "unsupported AF");
+		}
 	}
-	printf("IP: %s, MAC: %s\n", hbuf, ether_ntoa(&mw->mac));
 }
 
 void
@@ -271,15 +346,43 @@ print_list(void)
 	}
 }
 
-struct ether_addr *
-get_etheraddr(struct sockaddr *sa)
+struct macwatch *
+find_entrybyip(struct sockaddr *sa)
 {
 	struct macwatch		*mw;
+	int			 i;
+	struct pfr_addr		 addr;
+	struct sockaddr_in	 sa4;
+	struct sockaddr_in6	 sa6;
+	struct pfr_addr		*pfra;
+
+	if (sa == NULL)
+		return (NULL);
+
+	memset(&addr, 0, sizeof(struct pfr_addr));
+	addr.pfra_af = sa->sa_family;
+	switch (addr.pfra_af) {
+	case AF_INET:
+		memcpy(&sa4, sa, sizeof(struct sockaddr_in));
+		addr.pfra_ip4addr.s_addr = sa4.sin_addr.s_addr;
+		addr.pfra_net = 32;
+		break;
+	case AF_INET6:
+		memcpy(&sa6, sa, sizeof(struct sockaddr_in6));
+		memcpy(&addr.pfra_ip6addr, &sa6.sin6_addr.s6_addr, sizeof(struct in6_addr));
+		addr.pfra_net = 128;
+		break;
+	default:
+		errx(1, "%s: Unsupported AF", __func__);
+	}
 
 	LIST_FOREACH(mw, &macwatch_h, entries) {
-		if (mw->sa.sa_family == sa->sa_family)
-			if (memcmp(&mw->sa, sa, sa->sa_family == AF_INET6 ? sizeof(struct sockaddr_in6) : sizeof(struct sockaddr_in)) == 0)
-				return (&mw->mac);
+		for (i = 0; i < mw->addrlist.pfrb_size; i++) {
+			pfra = (struct pfr_addr *)(((caddr_t)mw->addrlist.pfrb_caddr) + sizeof(struct pfr_addr) * i);
+			if (pfra->pfra_af == addr.pfra_af)
+				if(memcmp(pfra, &addr, sizeof(struct pfr_addr)) == 0)
+					return (mw);
+		}
 	}
 	return (NULL);
 }
@@ -290,60 +393,161 @@ satosdl(struct sockaddr *sa)
         return ((struct sockaddr_dl *)(sa));
 }
 
-struct macwatch *
-get_addr(char *p, int addrs)
+int
+extract_addr(char *p, int addrs, struct sockaddr **s, struct ether_addr **e)
 {
-	char *t = p;
+	int			 search;
+	char			*t = p;
+	struct sockaddr		*sa;
+	struct ether_addr	*ea;
+
+	if (addrs == 0)
+		return (-1);
+
+	sa = NULL;
+	search = addrs & RTA_GATEWAY;
+	while (search) {
+		search >>= 1;
+		sa = (struct sockaddr *)t;
+		ADVANCE(t, sa);
+	}
+	if (sa == NULL || sa->sa_family != AF_LINK)
+		return (-1);
+
+	ea = (struct ether_addr *)LLADDR(satosdl(sa));
+	*e = ea;
+
+	sa = NULL;
+	t = p;
+	search = addrs & RTA_DST;
+	while (search) {
+		search >>= 1;
+		sa = (struct sockaddr *)t;
+		ADVANCE(t, sa);
+	}
+	if (sa == NULL || (sa->sa_family != AF_INET && sa->sa_family != AF_INET6))
+		return (-1);
+
+	*s = sa;
+	return (0);
+}
+
+struct macwatch *
+fill_macwatch(char *p, int addrs)
+{
 	struct sockaddr *sa;
-	struct macwatch  *mw = NULL;
+	struct macwatch  *mw = NULL, *previous_mw;
 	struct ether_addr *ea;
-	int lla, ipa;
 
-	if (addrs != 0) {
-		sa = NULL;
-		lla = addrs & RTA_GATEWAY;
-		while (lla) {
-			lla >>= 1;
-			sa = (struct sockaddr *)t;
-			ADVANCE(t, sa);
-		}
-		if (sa == NULL || sa->sa_family != AF_LINK)
-			return (NULL);
+	if(extract_addr(p, addrs, &sa, &ea))
+		return (NULL);
 
-		ea = (struct ether_addr *)LLADDR(satosdl(sa));
-		if (mac && !memcmp(ea, mac, sizeof(struct ether_addr)))
-			printf("macmatch! ");
-
-		sa = NULL;
-		t = p;
-		ipa = addrs & RTA_DST;
-		while (ipa) {
-			ipa >>= 1;
-			sa = (struct sockaddr *)t;
-			ADVANCE(t, sa);
-		}
-		if (sa == NULL || (sa->sa_family != AF_INET && sa->sa_family != AF_INET6))
-			return (NULL);
-
+	mw = find_entrybymac(ea);
+	previous_mw = mw;
+	if (mw == NULL) {
 		mw = malloc(sizeof(struct macwatch));
 		if (mw == NULL) {
 			printf("malloc()\n");
-			return (mw);
+			return (NULL);
 		}
-
+		memset(mw, 0, sizeof(struct macwatch));
 		memcpy(&mw->mac, ea, sizeof(struct ether_addr));
-		switch (sa->sa_family) {
-		case AF_INET:
-			memcpy(&mw->sa, sa, sizeof(struct sockaddr_in));
-			break;
-		case AF_INET6:
-			memcpy(&mw->sa, sa, sizeof(struct sockaddr_in6));
-			break;
-		default:
-			warn("unsupported AF");
+	}
+
+	if (insert_addr(&mw->addrlist, sa)) {
+		return (NULL);
+	}
+
+	if (previous_mw)
+		LIST_REMOVE(previous_mw, entries);
+
+	return (mw);
+}
+
+int
+insert_addr(struct pfr_buffer *b, struct sockaddr *sa)
+{
+	int			i, size;
+	struct pfr_addr		addr;
+	struct sockaddr_in	sa4;
+	struct sockaddr_in6	sa6;
+	struct pfr_addr		*pfra;
+
+	memset(&addr, 0, sizeof(struct pfr_addr));
+	addr.pfra_af = sa->sa_family;
+	switch (addr.pfra_af) {
+	case AF_INET:
+		memcpy(&sa4, sa, sizeof(struct sockaddr_in));
+		addr.pfra_ip4addr.s_addr = sa4.sin_addr.s_addr;
+		addr.pfra_net = 32;
+		break;
+	case AF_INET6:
+		memcpy(&sa6, sa, sizeof(struct sockaddr_in6));
+		memcpy(&addr.pfra_ip6addr, &sa6.sin6_addr.s6_addr, sizeof(struct in6_addr));
+		addr.pfra_net = 128;
+		break;
+	default:
+		errx(1, "%s: Unsupported AF", __func__);
+	}
+
+	if (b->pfrb_msize == b->pfrb_size)
+		if (buf_grow(b, 0))
+			return (-1);
+
+	size = b->pfrb_size;
+	for (i = 0; i < size; i++) {
+		pfra = (struct pfr_addr *)(((caddr_t)b->pfrb_caddr) + sizeof(struct pfr_addr) * i);
+		if (pfra->pfra_af == addr.pfra_af)
+			if(memcmp(pfra, &addr, sizeof(struct pfr_addr)) == 0)
+				return (0); /* do not insert duplicates */
+	}
+
+	memcpy(((caddr_t)b->pfrb_caddr) + sizeof(struct pfr_addr) * b->pfrb_size, &addr, sizeof(struct pfr_addr));
+	b->pfrb_size++;
+
+	return (0);
+}
+
+int
+remove_addr(struct pfr_buffer *b, struct sockaddr *sa)
+{
+	int			 i, size;
+	struct pfr_addr		 addr;
+	struct sockaddr_in	 sa4;
+	struct sockaddr_in6	 sa6;
+	struct pfr_addr		*pfra;
+
+	memset(&addr, 0, sizeof(struct pfr_addr));
+	addr.pfra_af = sa->sa_family;
+	switch (addr.pfra_af) {
+	case AF_INET:
+		memcpy(&sa4, sa, sizeof(struct sockaddr_in));
+		addr.pfra_ip4addr.s_addr = sa4.sin_addr.s_addr;
+		addr.pfra_net = 32;
+		break;
+	case AF_INET6:
+		memcpy(&sa6, sa, sizeof(struct sockaddr_in6));
+		memcpy(&addr.pfra_ip6addr, &sa6.sin6_addr.s6_addr, sizeof(struct in6_addr));
+		addr.pfra_net = 128;
+		break;
+	default:
+		errx(1, "%s: Unsupported AF", __func__);
+	}
+
+	size = b->pfrb_size;
+	for (i = 0; i < size; i++) {
+		pfra = (struct pfr_addr *)(((caddr_t)b->pfrb_caddr) + sizeof(struct pfr_addr) * i);
+		if (pfra->pfra_af == addr.pfra_af) {
+			if(memcmp(pfra, &addr, sizeof(struct pfr_addr)) == 0) {
+				memcpy(pfra, pfra + sizeof(struct pfr_addr), sizeof(struct pfr_addr)*(size-i-1));
+				b->pfrb_size--;
+			}
 		}
 	}
-	return (mw);
+	if (b->pfrb_size == 0)
+		free(b->pfrb_caddr);
+
+	return (b->pfrb_size);
 }
 
 void
@@ -382,47 +586,12 @@ get_entries(void)
                 rtm = (struct rt_msghdr *)next;
                 if (rtm->rtm_version != RTM_VERSION)
                         continue;
-		mw = get_addr(((char *)rtm + rtm->rtm_hdrlen), rtm->rtm_addrs);
-		if (mw)
+		mw = fill_macwatch(((char *)rtm + rtm->rtm_hdrlen), rtm->rtm_addrs);
+		if (mw) {
 			LIST_INSERT_HEAD(&macwatch_h, mw, entries);
+		}
         }
         free(buf);
-}
-
-int
-add_prefixes(struct pfr_buffer *b)
-{
-	struct pfr_addr	 addr;
-	struct macwatch *mw;
-	struct sockaddr_in sa;
-	struct sockaddr_in6 sa6;
-
-        LIST_FOREACH(mw, &macwatch_h, entries) {
-		memset(&addr, 0, sizeof(struct pfr_addr));
-		addr.pfra_af = mw->sa.sa_family;
-		switch (addr.pfra_af) {
-		case AF_INET:
-			memcpy(&sa, &mw->sa, sizeof(struct sockaddr_in));
-			addr.pfra_ip4addr.s_addr = sa.sin_addr.s_addr;
-			addr.pfra_net = 32;
-			break;
-		case AF_INET6:
-			memcpy(&sa6, &mw->sa, sizeof(struct sockaddr_in6));
-			memcpy(&addr.pfra_ip6addr, &sa6.sin6_addr.s6_addr, sizeof(struct in6_addr));
-			addr.pfra_net = 128;
-			break;
-		default:
-			errx(1, "Unsupported AF");
-		}
-
-		if (b->pfrb_msize == b->pfrb_size)
-			if (buf_grow(b, 0))
-				return (-1);
-
-		memcpy(((caddr_t)b->pfrb_caddr) + sizeof(struct pfr_addr) * b->pfrb_size, &addr, sizeof(struct pfr_addr));
-		b->pfrb_size++;
-        }
-	return (b->pfrb_size);
 }
 
 int
@@ -452,4 +621,3 @@ buf_grow(struct pfr_buffer *b, int minsize)
         b->pfrb_msize = minsize;
         return (0);
 }
-
