@@ -58,6 +58,7 @@ LIST_HEAD(macwatch_head, macwatch) macwatch_h;
 
 struct macwatch {
 	LIST_ENTRY(macwatch)	entries;
+	int			intable;
 	struct ether_addr	mac;
 	struct pfr_buffer	addrlist;
 };
@@ -142,10 +143,6 @@ main(int argc, char *argv[])
 	LIST_INIT(&macwatch_h);
 
 	get_entries();
-	print_list();
-	LIST_FOREACH(mw, &macwatch_h, entries) {
-		table_insert(table, mw->addrlist);
-	}
 
 /* Main loop */
         s = socket(PF_ROUTE, SOCK_RAW, AF_UNSPEC);
@@ -286,7 +283,8 @@ processrtmsg(struct rt_msghdr *rtm, int len)
 		if (previous_mw)
                 	LIST_REMOVE(previous_mw, entries);
 		LIST_INSERT_HEAD(&macwatch_h, mw, entries);
-		table_insert(table, mw->addrlist);
+		if (mw->intable)
+			mw->intable += table_insert(table, mw->addrlist);
 		break;
 	case RTM_DELETE:
 		if (mw == NULL)	/* Don't try to remove from non-existent list */
@@ -294,7 +292,7 @@ processrtmsg(struct rt_msghdr *rtm, int len)
 
                	LIST_REMOVE(previous_mw, entries);
 		n = remove_addr(&mw->addrlist, sa);
-		table_remove(table, mw->addrlist);
+		mw->intable -= table_remove(table, mw->addrlist);
 		if (n)
 			LIST_INSERT_HEAD(&macwatch_h, mw, entries);
 		else
@@ -302,9 +300,7 @@ processrtmsg(struct rt_msghdr *rtm, int len)
 		break;
 	default:
 		errx(1, "%s: Unsupported msg", __func__);
-		break;
 	}
-	print_list();
 }
 
 void
