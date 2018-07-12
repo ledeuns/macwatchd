@@ -20,6 +20,7 @@
 #include <net/pfvar.h>
 #include <fcntl.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
 
 enum {  PFRB_TABLES = 1, PFRB_TSTATS, PFRB_ADDRS, PFRB_ASTATS,
         PFRB_IFACES, PFRB_TRANS, PFRB_MAX };
@@ -77,9 +78,6 @@ sighdlr(int sig)
         case SIGINT: 
                 quit = 1;
                 break;
-        case SIGHUP:
-                reconfig = 1;
-                break;
         }
 }
 
@@ -97,10 +95,10 @@ main(int argc, char *argv[])
 {
 	int		debug = 0, ch;
 	unsigned int	filter = 0;
-	int		s;
+	int		s, f;
 	int		n;
 	char		msg[2048];
-	struct pollfd	pfd[1];
+	struct pollfd	pfd[2];
 	struct macwatch *mw;
 
 	memset(&table, 0, sizeof(struct pfr_table));
@@ -136,13 +134,19 @@ main(int argc, char *argv[])
 
 	signal(SIGTERM, sighdlr);
 	signal(SIGINT, sighdlr);
-	signal(SIGHUP, sighdlr);
 	signal(SIGPIPE, SIG_IGN);
 
 /* Init */
 	LIST_INIT(&macwatch_h);
 
 	get_entries();
+
+/* Control socket */
+
+	mkfifo(SOCKET_NAME, 0660);
+	f = open(SOCKET_NAME, O_RDWR | O_NONBLOCK, 0);
+	pfd[0].fd = f;
+	pfd[0].events = POLLIN;
 
 /* Main loop */
         s = socket(PF_ROUTE, SOCK_RAW, AF_UNSPEC);
@@ -154,16 +158,16 @@ main(int argc, char *argv[])
 	    sizeof(filter)) == -1)
                	err(1, "setsockopt(ROUTE_MSGFILTER)");
 
-	pfd[0].fd = s;
-	pfd[0].events = POLLIN;
+	pfd[1].fd = s;
+	pfd[1].events = POLLIN;
 
 	while (quit == 0) {
-		n = poll(pfd, 1, 60 * 1000);
+		n = poll(pfd, 2, 60 * 1000);
 		if (n == -1)
 			err(1, "poll");
-		if ((pfd[0].revents & (POLLERR|POLLNVAL)))
-			errx(1, "bad fd %d", pfd[0].fd);
-		if ((pfd[0].revents & (POLLIN|POLLHUP))) {
+		if ((pfd[1].revents & (POLLERR|POLLNVAL)))
+			errx(1, "bad fd %d", pfd[1].fd);
+		if ((pfd[1].revents & (POLLIN|POLLHUP))) {
 			if ((n = read(s, msg, sizeof(msg))) == -1) {
 				if (errno == EINTR)
 					continue;
@@ -171,10 +175,48 @@ main(int argc, char *argv[])
 			}
 			processrtmsg((struct rt_msghdr *)msg, n);
 		}
+
+		if ((pfd[0].revents & (POLLERR|POLLNVAL)))
+			errx(1, "bad fd %d", pfd[0].fd);
+		if ((pfd[0].revents & (POLLIN|POLLHUP))) {
+			if ((n = read(f, msg, sizeof(msg))) == -1) {
+				if (errno == EINTR)
+					continue;
+				err(1, "read");
+			}
+			char arg[49];
+			struct addrinfo hints, *res;
+			int add;
+
+			if (sscanf(msg, "a %48s", arg) == 1)
+				add = 1;
+			else if (sscanf(msg, "d %48s", arg) == 1)
+				add = -1;
+			else add = 0;
+
+			if (add) {
+				memset(&hints, 0, sizeof(hints));
+				hints.ai_family = AF_UNSPEC;
+				hints.ai_flags = AI_NUMERICHOST;
+				hints.ai_socktype = SOCK_DGRAM;
+				if (getaddrinfo(arg, "0", &hints, &res) != 0)
+					warnx("%s: bad value", arg);
+				if ((mw = find_entrybyip(res->ai_addr)) != NULL) {
+					if (add == 1)
+						mw->intable += table_insert(table, mw->addrlist);
+					else
+						mw->intable -= table_remove(table, mw->addrlist);
+				}
+				freeaddrinfo(res);
+			}
+		}
+		
 	}
 	if(!LIST_EMPTY(&macwatch_h)) {
 		mw = LIST_FIRST(&macwatch_h);
 		LIST_REMOVE(mw, entries);
+		table_remove(table, mw->addrlist);
+		free(mw->addrlist.pfrb_caddr);
 		free(mw);
 	}
 	printf("Done!\n");
