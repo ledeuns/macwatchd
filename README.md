@@ -1,5 +1,5 @@
 ```
-#doas ./macwatchd -t test
+# doas ./macwatchd -t test
 
 # pfctl -t test -T show                                                       
 # echo "a 192.168.10.10" > /var/run/macwatchd.sock                            
