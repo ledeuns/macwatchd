@@ -143,7 +143,8 @@ main(int argc, char *argv[])
 
 /* Control socket */
 
-	mkfifo(SOCKET_NAME, 0660);
+	mkfifo(SOCKET_NAME, S_IRUSR|S_IWUSR);
+	chmod(SOCKET_NAME, S_IRUSR|S_IWUSR|S_IRGRP|S_IWGRP);
 	f = open(SOCKET_NAME, O_RDWR | O_NONBLOCK, 0);
 	pfd[0].fd = f;
 	pfd[0].events = POLLIN;
@@ -290,6 +291,7 @@ processrtmsg(struct rt_msghdr *rtm, int len)
 	struct macwatch		*mw = NULL, *previous_mw;
 	struct ether_addr	*ea;
 	int			 n;
+	struct pfr_buffer	 buf;
 
         if (rtm->rtm_version != RTM_VERSION) {
                 warnx("routing message version %d not understood",
@@ -312,7 +314,7 @@ processrtmsg(struct rt_msghdr *rtm, int len)
 			memset(mw, 0, sizeof(struct macwatch));
 			memcpy(&mw->mac, ea, sizeof(struct ether_addr));
 		}
-		if (insert_addr(&mw->addrlist, sa)) /* XXX return value ? */
+		if (insert_addr(&mw->addrlist, sa))
 			break;
 		if (previous_mw)
                 	LIST_REMOVE(previous_mw, entries);
@@ -326,7 +328,12 @@ processrtmsg(struct rt_msghdr *rtm, int len)
 
                	LIST_REMOVE(previous_mw, entries);
 		n = remove_addr(&mw->addrlist, sa);
-		mw->intable -= table_remove(table, mw->addrlist); /* XXX bug here! */
+		memset(&buf, 0, sizeof(struct pfr_buffer));
+		if (insert_addr(&buf, sa)) {
+			errx(1, "%s: insert_addr() failed", __func__);
+		}
+		mw->intable -= table_remove(table, buf);
+		free(buf.pfrb_caddr);
 		if (mw->addrlist.pfrb_caddr)
 			LIST_INSERT_HEAD(&macwatch_h, mw, entries);
 		else
@@ -347,7 +354,7 @@ print_entry(struct macwatch *mw)
 	if (mw == NULL)
 		return;
 
-	printf("MAC: %s (%d)\n", ether_ntoa(&mw->mac), mw->addrlist.pfrb_size);
+	printf("MAC: %s :\n", ether_ntoa(&mw->mac));
 
 	pfra = (struct pfr_addr *)mw->addrlist.pfrb_caddr;
 	for (i = 0; i < mw->addrlist.pfrb_size; i++) {
