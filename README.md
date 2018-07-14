@@ -13,5 +13,5 @@
 #
 ```
 
-working but still needs some love (process separation, control program,
+PoC working but still needs some love (process separation, control program,
 etc...)

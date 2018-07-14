@@ -225,7 +225,6 @@ main(int argc, char *argv[])
 int
 table_insert(struct pfr_table tbl, struct pfr_buffer pfrb)
 {
-	struct pfr_buffer b;
 	struct pfioc_table io;
 	int		 dev = -1;
 
@@ -233,10 +232,7 @@ table_insert(struct pfr_table tbl, struct pfr_buffer pfrb)
 	if (dev == -1)
 		err(1, "%s", pf_device);
 
-	memset(&b, 0, sizeof(struct pfr_buffer));
 	memset(&io, 0, sizeof(struct pfioc_table));
-	b.pfrb_caddr = pfrb.pfrb_caddr;
-	b.pfrb_type = PFRB_ADDRS;
         io.pfrio_flags = 0;
         io.pfrio_table = tbl;
         io.pfrio_buffer = pfrb.pfrb_caddr;
@@ -252,7 +248,6 @@ table_insert(struct pfr_table tbl, struct pfr_buffer pfrb)
 int
 table_remove(struct pfr_table tbl, struct pfr_buffer pfrb)
 {
-	struct pfr_buffer b;
 	struct pfioc_table io;
 	int		 dev = -1;
 
@@ -260,10 +255,7 @@ table_remove(struct pfr_table tbl, struct pfr_buffer pfrb)
 	if (dev == -1)
 		err(1, "%s", pf_device);
 
-	memset(&b, 0, sizeof(struct pfr_buffer));
 	memset(&io, 0, sizeof(struct pfioc_table));
-	b.pfrb_caddr = pfrb.pfrb_caddr;
-	b.pfrb_type = PFRB_ADDRS;
         io.pfrio_flags = 0;
         io.pfrio_table = tbl;
         io.pfrio_buffer = pfrb.pfrb_caddr;
@@ -320,7 +312,7 @@ processrtmsg(struct rt_msghdr *rtm, int len)
 			memset(mw, 0, sizeof(struct macwatch));
 			memcpy(&mw->mac, ea, sizeof(struct ether_addr));
 		}
-		if (insert_addr(&mw->addrlist, sa))
+		if (insert_addr(&mw->addrlist, sa)) /* XXX return value ? */
 			break;
 		if (previous_mw)
                 	LIST_REMOVE(previous_mw, entries);
@@ -334,8 +326,8 @@ processrtmsg(struct rt_msghdr *rtm, int len)
 
                	LIST_REMOVE(previous_mw, entries);
 		n = remove_addr(&mw->addrlist, sa);
-		mw->intable -= table_remove(table, mw->addrlist);
-		if (n)
+		mw->intable -= table_remove(table, mw->addrlist); /* XXX bug here! */
+		if (mw->addrlist.pfrb_caddr)
 			LIST_INSERT_HEAD(&macwatch_h, mw, entries);
 		else
 			free(mw);
@@ -577,13 +569,16 @@ remove_addr(struct pfr_buffer *b, struct sockaddr *sa)
 		pfra = (struct pfr_addr *)(((caddr_t)b->pfrb_caddr) + sizeof(struct pfr_addr) * i);
 		if (pfra->pfra_af == addr.pfra_af) {
 			if(memcmp(pfra, &addr, sizeof(struct pfr_addr)) == 0) {
-				memcpy(pfra, pfra + sizeof(struct pfr_addr), sizeof(struct pfr_addr)*(size-i-1));
+				memmove(pfra, ((caddr_t)pfra + sizeof(struct pfr_addr)), sizeof(struct pfr_addr)*(size-i-1));
 				b->pfrb_size--;
 			}
 		}
 	}
-	if (b->pfrb_size == 0)
+	if (b->pfrb_size == 0) {
 		free(b->pfrb_caddr);
+		b->pfrb_msize = 0;
+		b->pfrb_caddr = NULL;
+	}
 
 	return (b->pfrb_size);
 }
