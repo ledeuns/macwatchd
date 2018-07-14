@@ -1,5 +1,5 @@
 PROG=	macwatchd
-SRCS=	macwatchd.c
+SRCS=	macwatchd.c log.c
 CFLAGS+= -Wall -I${.CURDIR}
 CFLAGS+= -Wstrict-prototypes -Wmissing-prototypes
 CFLAGS+= -Wmissing-declarations

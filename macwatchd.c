@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <syslog.h>
 #include <signal.h>
 #include <unistd.h>
 #include <errno.h>
@@ -21,6 +22,8 @@
 #include <fcntl.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
+
+#include "log.h"
 
 enum {  PFRB_TABLES = 1, PFRB_TSTATS, PFRB_ADDRS, PFRB_ASTATS,
         PFRB_IFACES, PFRB_TRANS, PFRB_MAX };
@@ -47,6 +50,7 @@ int		remove_addr(struct pfr_buffer *, struct sockaddr *);
 int		table_insert(struct pfr_table, struct pfr_buffer);
 int		table_remove(struct pfr_table, struct pfr_buffer);
 struct ether_addr *get_etheraddr(struct sockaddr *);
+const char	*log_addr(struct sockaddr *);
 int		main(int, char *[]);
 
 volatile sig_atomic_t	 quit, reconfig;
@@ -101,6 +105,9 @@ main(int argc, char *argv[])
 	struct pollfd	pfd[2];
 	struct macwatch *mw;
 
+        log_init(1, LOG_DAEMON);        /* log to stderr until daemonized */
+        log_setverbose(1);
+
 	memset(&table, 0, sizeof(struct pfr_table));
 
 	while ((ch = getopt(argc, argv, "dm:p:t:")) != -1) {
@@ -129,8 +136,13 @@ main(int argc, char *argv[])
 		}
 	}
 
+        log_init(debug, LOG_DAEMON);
+        log_setverbose(debug);
+
 	if (!debug)
 		daemon(1, 0);
+
+	log_info("startup");
 
 	signal(SIGTERM, sighdlr);
 	signal(SIGINT, sighdlr);
@@ -152,12 +164,12 @@ main(int argc, char *argv[])
 /* Main loop */
         s = socket(PF_ROUTE, SOCK_RAW, AF_UNSPEC);
         if (s == -1)
-                err(1, "socket");
+                fatal("socket");
 
 	filter = ROUTE_FILTER(RTM_RESOLVE) | ROUTE_FILTER(RTM_DELETE);
 	if (setsockopt(s, AF_ROUTE, ROUTE_MSGFILTER, &filter,
 	    sizeof(filter)) == -1)
-               	err(1, "setsockopt(ROUTE_MSGFILTER)");
+               	fatal("setsockopt(ROUTE_MSGFILTER)");
 
 	pfd[1].fd = s;
 	pfd[1].events = POLLIN;
@@ -165,25 +177,25 @@ main(int argc, char *argv[])
 	while (quit == 0) {
 		n = poll(pfd, 2, 60 * 1000);
 		if (n == -1)
-			err(1, "poll");
+			fatal("poll");
 		if ((pfd[1].revents & (POLLERR|POLLNVAL)))
-			errx(1, "bad fd %d", pfd[1].fd);
+			fatalx("bad fd %d", pfd[1].fd);
 		if ((pfd[1].revents & (POLLIN|POLLHUP))) {
 			if ((n = read(s, msg, sizeof(msg))) == -1) {
 				if (errno == EINTR)
 					continue;
-				err(1, "read");
+				fatal("read");
 			}
 			processrtmsg((struct rt_msghdr *)msg, n);
 		}
 
 		if ((pfd[0].revents & (POLLERR|POLLNVAL)))
-			errx(1, "bad fd %d", pfd[0].fd);
+			fatalx("bad fd %d", pfd[0].fd);
 		if ((pfd[0].revents & (POLLIN|POLLHUP))) {
 			if ((n = read(f, msg, sizeof(msg))) == -1) {
 				if (errno == EINTR)
 					continue;
-				err(1, "read");
+				fatal("read");
 			}
 			char arg[49];
 			struct addrinfo hints, *res;
@@ -201,7 +213,7 @@ main(int argc, char *argv[])
 				hints.ai_flags = AI_NUMERICHOST;
 				hints.ai_socktype = SOCK_DGRAM;
 				if (getaddrinfo(arg, "0", &hints, &res) != 0)
-					warnx("%s: bad value", arg);
+					log_warnx("%s: bad value", arg);
 				if ((mw = find_entrybyip(res->ai_addr)) != NULL) {
 					if (add == 1)
 						mw->intable += table_insert(table, mw->addrlist);
@@ -220,7 +232,9 @@ main(int argc, char *argv[])
 		free(mw->addrlist.pfrb_caddr);
 		free(mw);
 	}
-	printf("Done!\n");
+
+	log_info("terminating");
+	return (0);
 }
 
 int
@@ -294,13 +308,14 @@ processrtmsg(struct rt_msghdr *rtm, int len)
 	struct pfr_buffer	 buf;
 
         if (rtm->rtm_version != RTM_VERSION) {
-                warnx("routing message version %d not understood",
+                log_warnx("routing message version %d not understood",
                     rtm->rtm_version);
                 return;
         }
 
         if(extract_addr(((char *)rtm + rtm->rtm_hdrlen), rtm->rtm_addrs, &sa, &ea))
                 return;
+
 
         mw = find_entrybymac(ea);
         previous_mw = mw;
@@ -316,6 +331,7 @@ processrtmsg(struct rt_msghdr *rtm, int len)
 		}
 		if (insert_addr(&mw->addrlist, sa))
 			break;
+		log_info("ADD: %s as %s", log_addr(sa), ether_ntoa(&mw->mac));
 		if (previous_mw)
                 	LIST_REMOVE(previous_mw, entries);
 		LIST_INSERT_HEAD(&macwatch_h, mw, entries);
@@ -328,6 +344,7 @@ processrtmsg(struct rt_msghdr *rtm, int len)
 
                	LIST_REMOVE(previous_mw, entries);
 		n = remove_addr(&mw->addrlist, sa);
+		log_info("DEL: %s as %s", log_addr(sa), ether_ntoa(&mw->mac));
 		memset(&buf, 0, sizeof(struct pfr_buffer));
 		if (insert_addr(&buf, sa)) {
 			errx(1, "%s: insert_addr() failed", __func__);
@@ -484,7 +501,7 @@ fill_macwatch(char *p, int addrs)
 	if (mw == NULL) {
 		mw = malloc(sizeof(struct macwatch));
 		if (mw == NULL) {
-			printf("malloc()\n");
+			log_warnx("malloc()\n");
 			return (NULL);
 		}
 		memset(mw, 0, sizeof(struct macwatch));
@@ -660,4 +677,28 @@ buf_grow(struct pfr_buffer *b, int minsize)
         b->pfrb_caddr = p;
         b->pfrb_msize = minsize;
         return (0);
+}
+
+const char *
+log_addr(struct sockaddr *sa)
+{
+	static char		buf[48];
+	struct sockaddr_in	sa4;
+	struct sockaddr_in6	sa6;
+
+	memset(buf, 0, sizeof(buf));
+
+	switch (sa->sa_family) {
+	case AF_INET:
+		memcpy(&sa4, sa, sizeof(struct sockaddr_in));
+		inet_ntop(AF_INET, &sa4.sin_addr, buf, sizeof(buf));
+		return (buf);
+	case AF_INET6:
+		memcpy(&sa6, sa, sizeof(struct sockaddr_in6));
+		inet_ntop(AF_INET6, &sa6.sin6_addr, buf, sizeof(buf));
+		return (buf);
+	default:
+		break;
+	}
+	return ("???");
 }
