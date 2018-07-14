@@ -511,6 +511,7 @@ fill_macwatch(char *p, int addrs)
 	if (insert_addr(&mw->addrlist, sa)) {
 		return (NULL);
 	}
+	log_info("ADD: %s as %s", log_addr(sa), ether_ntoa(&mw->mac));
 
 	if (previous_mw)
 		LIST_REMOVE(previous_mw, entries);
