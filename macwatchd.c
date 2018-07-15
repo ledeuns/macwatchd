@@ -12,6 +12,7 @@
 #include <net/if.h>
 #include <netinet/in.h>
 #include <netinet/if_ether.h>
+#include <net/if_types.h>
 #include <net/if_dl.h>
 #include <arpa/inet.h>
 #include <netdb.h>
@@ -166,7 +167,7 @@ main(int argc, char *argv[])
         if (s == -1)
                 fatal("socket");
 
-	filter = ROUTE_FILTER(RTM_RESOLVE) | ROUTE_FILTER(RTM_DELETE);
+	filter = ROUTE_FILTER(RTM_RESOLVE) | ROUTE_FILTER(RTM_DELETE) | ROUTE_FILTER(RTM_ADD);
 	if (setsockopt(s, AF_ROUTE, ROUTE_MSGFILTER, &filter,
 	    sizeof(filter)) == -1)
                	fatal("setsockopt(ROUTE_MSGFILTER)");
@@ -201,11 +202,11 @@ main(int argc, char *argv[])
 			struct addrinfo hints, *res;
 			int add;
 
+			add = 0;
 			if (sscanf(msg, "a %48s", arg) == 1)
 				add = 1;
 			else if (sscanf(msg, "d %48s", arg) == 1)
 				add = -1;
-			else add = 0;
 
 			if (add) {
 				memset(&hints, 0, sizeof(hints));
@@ -221,7 +222,9 @@ main(int argc, char *argv[])
 						mw->intable -= table_remove(table, mw->addrlist);
 				}
 				freeaddrinfo(res);
-			}
+			} else
+				print_list();
+	
 		}
 		
 	}
@@ -313,14 +316,19 @@ processrtmsg(struct rt_msghdr *rtm, int len)
                 return;
         }
 
-        if(extract_addr(((char *)rtm + rtm->rtm_hdrlen), rtm->rtm_addrs, &sa, &ea))
+        if (extract_addr(((char *)rtm + rtm->rtm_hdrlen), rtm->rtm_addrs, &sa, &ea))
                 return;
-
 
         mw = find_entrybymac(ea);
         previous_mw = mw;
 
         switch (rtm->rtm_type) {
+	case RTM_ADD:
+		get_entries();
+		mw = find_entrybyip(sa);
+        	previous_mw = mw;
+		if (mw == NULL)
+			break;
 	case RTM_RESOLVE:
 		if (mw == NULL) {
 			mw = malloc(sizeof(struct macwatch));
@@ -331,7 +339,7 @@ processrtmsg(struct rt_msghdr *rtm, int len)
 		}
 		if (insert_addr(&mw->addrlist, sa))
 			break;
-		log_info("ADD: %s as %s", log_addr(sa), ether_ntoa(&mw->mac));
+		log_info("RESOLVE: %s as %s", log_addr(sa), ether_ntoa(&mw->mac));
 		if (previous_mw)
                 	LIST_REMOVE(previous_mw, entries);
 		LIST_INSERT_HEAD(&macwatch_h, mw, entries);
@@ -341,10 +349,9 @@ processrtmsg(struct rt_msghdr *rtm, int len)
 	case RTM_DELETE:
 		if (mw == NULL)	/* Don't try to remove from non-existent list */
 			break;		
-
                	LIST_REMOVE(previous_mw, entries);
 		n = remove_addr(&mw->addrlist, sa);
-		log_info("DEL: %s as %s", log_addr(sa), ether_ntoa(&mw->mac));
+		log_info("DELETE: %s as %s", log_addr(sa), ether_ntoa(&mw->mac));
 		memset(&buf, 0, sizeof(struct pfr_buffer));
 		if (insert_addr(&buf, sa)) {
 			errx(1, "%s: insert_addr() failed", __func__);
@@ -453,7 +460,7 @@ extract_addr(char *p, int addrs, struct sockaddr **s, struct ether_addr **e)
 	int			 search;
 	char			*t = p;
 	struct sockaddr		*sa;
-	struct ether_addr	*ea;
+	struct ether_addr	*ea, nullea;
 
 	if (addrs == 0)
 		return (-1);
@@ -469,7 +476,11 @@ extract_addr(char *p, int addrs, struct sockaddr **s, struct ether_addr **e)
 		return (-1);
 
 	ea = (struct ether_addr *)LLADDR(satosdl(sa));
-	*e = ea;
+	memset(&nullea, 0, sizeof(struct ether_addr));
+	if (memcmp(ea, &nullea,  sizeof(struct ether_addr)))
+		*e = ea;
+	else
+		*e = NULL;
 
 	sa = NULL;
 	t = p;
@@ -496,12 +507,15 @@ fill_macwatch(char *p, int addrs)
 	if(extract_addr(p, addrs, &sa, &ea))
 		return (NULL);
 
+	if (ea == NULL)
+		return (NULL);
+
 	mw = find_entrybymac(ea);
 	previous_mw = mw;
 	if (mw == NULL) {
 		mw = malloc(sizeof(struct macwatch));
 		if (mw == NULL) {
-			log_warnx("malloc()\n");
+			log_warnx("%s:malloc()\n", __func__);
 			return (NULL);
 		}
 		memset(mw, 0, sizeof(struct macwatch));
