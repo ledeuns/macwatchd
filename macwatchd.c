@@ -266,8 +266,10 @@ table_insert(struct pfr_table tbl, struct pfr_buffer pfrb)
 int
 table_remove(struct pfr_table tbl, struct pfr_buffer pfrb)
 {
-	struct pfioc_table io;
-	int		 dev = -1;
+	struct pfioc_table	 io;
+	int			 dev = -1, i;
+	struct pfioc_state_kill	 psk;
+	struct pfr_addr		*pfra;
 
 	dev = open(pf_device, O_RDWR);
 	if (dev == -1)
@@ -281,6 +283,22 @@ table_remove(struct pfr_table tbl, struct pfr_buffer pfrb)
         io.pfrio_size = pfrb.pfrb_size;
         if (ioctl(dev, DIOCRDELADDRS, &io))
                 err(1, "DIOCRDELADDRS");
+
+	for (i = 0; i < pfrb.pfrb_size; i++) {
+		pfra = (struct pfr_addr *)(((caddr_t)pfrb.pfrb_caddr) + sizeof(struct pfr_addr) * i);
+		memset(&psk, 0, sizeof(psk));
+		psk.psk_af = pfra->pfra_af;
+		memcpy(&psk.psk_src.addr.v.a.addr, pfra, sizeof(psk.psk_src.addr.v.a.addr));
+		memset(&psk.psk_src.addr.v.a.mask, 0xff, sizeof(psk.psk_src.addr.v.a.mask));
+		if (ioctl(dev, DIOCKILLSTATES, &psk))
+                	err(1, "DIOCKILLSTATES src");
+
+		memset(&psk.psk_src.addr.v.a.mask, 0, sizeof(psk.psk_src.addr.v.a.mask));
+		memcpy(&psk.psk_dst.addr.v.a.addr, pfra, sizeof(psk.psk_dst.addr.v.a.addr));
+		memset(&psk.psk_dst.addr.v.a.mask, 0xff, sizeof(psk.psk_dst.addr.v.a.mask));
+		if (ioctl(dev, DIOCKILLSTATES, &psk))
+                	err(1, "DIOCKILLSTATES dst");
+	}
 
 	close(dev);
 	return (io.pfrio_ndel);
@@ -380,7 +398,6 @@ print_entry(struct macwatch *mw)
 
 	printf("MAC: %s :\n", ether_ntoa(&mw->mac));
 
-	pfra = (struct pfr_addr *)mw->addrlist.pfrb_caddr;
 	for (i = 0; i < mw->addrlist.pfrb_size; i++) {
 		pfra = (struct pfr_addr *)(((caddr_t)mw->addrlist.pfrb_caddr) + sizeof(struct pfr_addr) * i);
 		switch (pfra->pfra_af) {
